@@ -373,13 +373,19 @@ def post_process_finding_save(finding, dedupe_option=True, rules_option=True, pr
         else:
             deduplicationLogger.warning("skipping dedupe because hash_code is None")
 
+    if getattr(finding, "_dojo_skip_post_processing", False):
+        merged_into = getattr(finding, "_dojo_merged_into", None)
+        merged_pk = merged_into.pk if merged_into else None
+        deduplicationLogger.debug(
+            "finding %s post processing skipped due to occurrence consolidation into %s",
+            finding.pk,
+            merged_pk,
+        )
+        return
+
     if system_settings.false_positive_history:
-        # Only perform false positive history if deduplication is disabled
-        if system_settings.enable_deduplication:
-            deduplicationLogger.warning("skipping false positive history because deduplication is also enabled")
-        else:
-            from dojo.utils import do_false_positive_history
-            do_false_positive_history(finding, *args, **kwargs)
+        from dojo.utils import do_false_positive_history
+        do_false_positive_history(finding, *args, **kwargs)
 
     # STEP 2 run all non-status changing tasks as celery tasks in the background
     if issue_updater_option:

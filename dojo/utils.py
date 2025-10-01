@@ -30,6 +30,7 @@ from django.contrib import messages
 from django.contrib.auth.signals import user_logged_in, user_logged_out, user_login_failed
 from django.contrib.contenttypes.models import ContentType
 from django.core.paginator import Paginator
+from django.db import transaction
 from django.db.models import Case, Count, F, IntegerField, Q, Sum, Value, When
 from django.db.models.query import QuerySet
 from django.db.models.signals import post_save
@@ -60,6 +61,7 @@ from dojo.models import (
     FileUpload,
     Finding,
     Finding_Group,
+    FindingOccurrence,
     Finding_Template,
     Language_Type,
     Languages,
@@ -309,12 +311,19 @@ def do_dedupe_finding(new_finding, *args, **kwargs):
     if dedupe_method := get_custom_method("FINDING_DEDUPE_METHOD"):
         return dedupe_method(new_finding, *args, **kwargs)
 
+    coordinated_fp_mode = False
     try:
-        enabled = System_Settings.objects.get(no_cache=True).enable_deduplication
+        system_settings = System_Settings.objects.get(no_cache=True)
     except System_Settings.DoesNotExist:
         logger.warning("system settings not found")
         enabled = False
+        coordinated_fp_mode = False
+    else:
+        enabled = system_settings.enable_deduplication
     if enabled:
+        coordinated_fp_mode = system_settings.false_positive_history
+        if coordinated_fp_mode:
+            setattr(new_finding, "_dojo_occurrence_tracking", True)
         deduplicationLogger.debug("dedupe for: " + str(new_finding.id)
                     + ":" + str(new_finding.title))
         deduplicationAlgorithm = new_finding.test.deduplication_algorithm
@@ -519,6 +528,53 @@ def deduplicate_uid_or_hash_code(new_finding):
         break
 
 
+def merge_duplicate_occurrence(existing_finding, new_finding):
+    """Consolidate duplicate finding data into the original finding."""
+
+    occurrence_seen = getattr(new_finding, "last_seen", None) or timezone.now()
+    first_seen_candidate = getattr(new_finding, "first_seen", None)
+    existing_first_seen = existing_finding.first_seen
+
+    with transaction.atomic():
+        update_kwargs = {
+            "nb_occurrences": F("nb_occurrences") + 1,
+            "last_seen": occurrence_seen,
+        }
+        if first_seen_candidate and (existing_first_seen is None or first_seen_candidate < existing_first_seen):
+            update_kwargs["first_seen"] = first_seen_candidate
+
+        Finding.objects.filter(pk=existing_finding.pk).update(**update_kwargs)
+
+    existing_finding.refresh_from_db(fields=["nb_occurrences", "last_seen", "first_seen"])
+
+    if new_finding.test_id:
+        existing_finding.found_by.add(new_finding.test.test_type)
+
+    if new_finding.endpoints.exists():
+        for endpoint in new_finding.endpoints.all():
+            try:
+                existing_finding.endpoints.add(endpoint)
+            except IntegrityError:
+                continue
+
+    scan_identifier = new_finding.unique_id_from_tool or new_finding.hash_code or str(new_finding.pk)
+
+    FindingOccurrence.objects.create(
+        finding=existing_finding,
+        test=new_finding.test if new_finding.test_id else None,
+        seen=occurrence_seen,
+        scan_id=scan_identifier,
+        raw_meta={
+            "source_finding_id": new_finding.pk,
+            "imported_at": occurrence_seen.isoformat(),
+        },
+    )
+
+    new_finding._dojo_skip_post_processing = True
+    new_finding._dojo_merged_into = existing_finding
+    new_finding.delete()
+
+
 def set_duplicate(new_finding, existing_finding):
     deduplicationLogger.debug(f"new_finding.status(): {new_finding.id} {new_finding.status()}")
     deduplicationLogger.debug(f"existing_finding.status(): {existing_finding.id} {existing_finding.status()}")
@@ -532,6 +588,9 @@ def set_duplicate(new_finding, existing_finding):
     if is_duplicate_reopen(new_finding, existing_finding):
         msg = "Found a regression. Ignore this so that a new duplicate chain can be made"
         raise Exception(msg)
+    if getattr(new_finding, "_dojo_occurrence_tracking", False):
+        merge_duplicate_occurrence(existing_finding, new_finding)
+        return
     if new_finding.duplicate and finding_mitigated(existing_finding):
         msg = "Skip this finding as we do not want to attach a new duplicate to a mitigated finding"
         raise Exception(msg)

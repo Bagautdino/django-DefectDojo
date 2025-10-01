@@ -416,21 +416,20 @@ class System_Settings(models.Model):
     )
 
     false_positive_history = models.BooleanField(
-        default=False, help_text=_(
-            "(EXPERIMENTAL) DefectDojo will automatically mark the finding as a "
-            "false positive if an equal finding (according to its dedupe algorithm) "
-            "has been previously marked as a false positive on the same product. "
-            "ATTENTION: Although the deduplication algorithm is used to determine "
-            "if a finding should be marked as a false positive, this feature will "
-            "not work if deduplication is enabled since it doesn't make sense to use both.",
+        default=False,
+        help_text=_(
+            "DefectDojo will automatically mark the finding as a false positive if an equal "
+            "finding (according to its dedupe algorithm) has been previously marked as a false positive "
+            "on the same product. When used together with deduplication, repeated occurrences are "
+            "counted without creating additional findings.",
         ),
     )
 
     retroactive_false_positive_history = models.BooleanField(
-        default=False, help_text=_(
-            "(EXPERIMENTAL) FP History will also retroactively mark/unmark all "
-            "existing equal findings in the same product as a false positives. "
-            "Only works if the False Positive History feature is also enabled.",
+        default=False,
+        help_text=_(
+            "False Positive History will also retroactively mark/unmark all existing equal findings in the same "
+            "product as false positives. Only works if the False Positive History feature is also enabled.",
         ),
     )
 
@@ -2464,6 +2463,24 @@ class Finding(models.Model):
                                           blank=True, on_delete=models.DO_NOTHING,
                                           verbose_name=_("Duplicate Finding"),
                                           help_text=_("Link to the original finding if this finding is a duplicate."))
+    nb_occurrences = models.PositiveIntegerField(
+        default=1,
+        editable=False,
+        verbose_name=_("Occurrences"),
+        help_text=_("Number of times this finding signature has been observed."),
+    )
+    first_seen = models.DateTimeField(
+        default=timezone.now,
+        editable=False,
+        verbose_name=_("First Seen"),
+        help_text=_("Timestamp of the very first time this finding was recorded."),
+    )
+    last_seen = models.DateTimeField(
+        default=timezone.now,
+        editable=False,
+        verbose_name=_("Last Seen"),
+        help_text=_("Timestamp of the most recent occurrence of this finding."),
+    )
     out_of_scope = models.BooleanField(default=False,
                                        verbose_name=_("Out Of Scope"),
                                        help_text=_("Denotes if this flaw falls outside the scope of the test and/or engagement."))
@@ -2713,6 +2730,8 @@ class Finding(models.Model):
             models.Index(fields=["title"]),
             models.Index(fields=["hash_code"]),
             models.Index(fields=["unique_id_from_tool"]),
+            models.Index(fields=["hash_code", "false_p"]),
+            models.Index(fields=["unique_id_from_tool", "false_p"]),
             # models.Index(fields=['file_path']), # can't add index because the field has max length 4000.
             models.Index(fields=["line"]),
             models.Index(fields=["component_name"]),
@@ -2748,6 +2767,17 @@ class Finding(models.Model):
         if not user:
             from dojo.utils import get_current_user
             user = get_current_user()
+
+        now = timezone.now()
+        if self.pk is None:
+            self.nb_occurrences = self.nb_occurrences or 1
+            self.first_seen = self.first_seen or now
+            self.last_seen = self.last_seen or now
+        else:
+            if not self.first_seen:
+                self.first_seen = now
+            if not self.last_seen:
+                self.last_seen = now
         # Title Casing
         from titlecase import titlecase
         self.title = titlecase(self.title[:511])
@@ -2841,6 +2871,10 @@ class Finding(models.Model):
         # Wipe the IDs of the new object
         if test:
             copy.test = test
+        now = timezone.now()
+        copy.nb_occurrences = 1
+        copy.first_seen = now
+        copy.last_seen = now
         # Save the object before setting any ManyToMany relationships
         copy.save()
         # Copy the notes
@@ -3463,6 +3497,51 @@ class Finding(models.Model):
             else:
                 self.hash_code = self.compute_hash_code()
                 deduplicationLogger.debug("Hash_code computed for finding: %s", self.hash_code)
+
+
+class FindingOccurrence(models.Model):
+    finding = models.ForeignKey(
+        "Finding",
+        on_delete=models.CASCADE,
+        related_name="occurrences",
+        verbose_name=_("Finding"),
+    )
+    test = models.ForeignKey(
+        Test,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="finding_occurrences",
+        verbose_name=_("Test"),
+    )
+    seen = models.DateTimeField(
+        default=timezone.now,
+        verbose_name=_("Seen"),
+        help_text=_("Timestamp of this occurrence."),
+    )
+    scan_id = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        verbose_name=_("Scan Identifier"),
+        help_text=_("Identifier of the source scan that produced this occurrence."),
+    )
+    raw_meta = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name=_("Raw Metadata"),
+        help_text=_("Arbitrary metadata captured for this occurrence."),
+    )
+
+    class Meta:
+        ordering = ("-seen", "finding")
+        indexes = [
+            models.Index(fields=["finding", "seen"]),
+            models.Index(fields=["test", "seen"]),
+        ]
+
+    def __str__(self):
+        return f"Occurrence of {self.finding_id} at {self.seen}"
 
 
 class FindingAdmin(admin.ModelAdmin):
